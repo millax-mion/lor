@@ -278,6 +278,7 @@ header{background:#1a1814;color:#f8f5f0;padding:14px 22px;display:flex;align-ite
     </div>
     <div class="btn-row" style="margin-top:18px">
       <button class="btn btn-secondary" onclick="goTo(3)">← Edit details</button>
+      <button class="btn btn-accent" id="continuebtn" style="display:none" onclick="continueLetter()">✓ Finish the letter</button>
       <button class="btn btn-secondary" onclick="generate()">↻ Regenerate</button>
       <button class="btn btn-secondary" onclick="startOver()">Start new letter</button>
     </div>
@@ -594,50 +595,153 @@ function generate(){
     ? geminiRequest(key, userPrompt, SYSTEM_PROMPT, 0)
     : claudeRequest(key, userPrompt, SYSTEM_PROMPT);
 
-  req.then(function(res){ finish(res.text); })
+  req.then(function(res){
+       finish(res.text);
+       if(res.truncated || !looksComplete(res.text)){
+         LAST = { key: key, userPrompt: userPrompt, d: d };
+         showError('This letter looks like it stopped before the sign-off. Click "Finish the letter" below and it will pick up from where it left off.');
+         document.getElementById('continuebtn').style.display = 'inline-flex';
+       } else {
+         document.getElementById('continuebtn').style.display = 'none';
+       }
+     })
      .catch(function(err){ failGracefully(err, d); });
 }
 
-/* Reusable Gemini request with automatic model fallback */
-function geminiRequest(key, userPrompt, systemPrompt, modelIndex){
-  var idx = modelIndex || 0;
-  if(idx >= GEMINI_MODELS.length){
-    return Promise.reject(new Error('None of the available Gemini models responded. Try again later or switch modes in Setup.'));
+/* Manual continuation if a letter still comes back short */
+var LAST = null;
+function continueLetter(){
+  if(!LAST) return;
+  var btn = document.getElementById('continuebtn');
+  btn.disabled = true;
+  btn.textContent = 'Finishing…';
+  var existing = document.getElementById('letter-body').innerText;
+
+  var req = (MODE === 'gemini')
+    ? geminiRequest(LAST.key, LAST.userPrompt, SYSTEM_PROMPT, 0, existing, true, 0)
+    : claudeRequest(LAST.key, LAST.userPrompt, SYSTEM_PROMPT, existing, 0);
+
+  req.then(function(res){
+       document.getElementById('letter-body').textContent = res.text;
+       btn.disabled = false;
+       btn.textContent = '✓ Finish the letter';
+       if(looksComplete(res.text)){
+         document.getElementById('errbox').style.display = 'none';
+         btn.style.display = 'none';
+       }
+     })
+     .catch(function(err){
+       btn.disabled = false;
+       btn.textContent = '✓ Finish the letter';
+       showError(explainError(err));
+     });
+}
+
+/* Models that accept thinkingBudget: 0 (Gemini 2.5 series). Gemini 3 Flash
+   cannot fully disable thinking, so those get headroom instead. */
+function supportsThinkingOff(model){ return /2\.5-flash/.test(model) && !/lite/.test(model); }
+
+/* Build the request body. useThinkingCfg is dropped on retry if a model rejects it. */
+function geminiBody(userPrompt, systemPrompt, priorText, model, useThinkingCfg){
+  var contents = [{ role: 'user', parts: [{ text: userPrompt }] }];
+  if(priorText){
+    contents.push({ role: 'model', parts: [{ text: priorText }] });
+    contents.push({ role: 'user', parts: [{ text: 'Continue the letter from exactly where it stopped. Do not repeat any text already written, do not restate the opening, and do not add commentary. Pick up mid-sentence if it stopped mid-sentence, and carry through to the full sign-off.' }] });
   }
+  var gen = { temperature: 0.85, maxOutputTokens: 8192 };
+  if(useThinkingCfg && supportsThinkingOff(model)){
+    gen.thinkingConfig = { thinkingBudget: 0 };
+  }
+  return {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: contents,
+    generationConfig: gen
+  };
+}
+
+/* Reusable Gemini request. Handles model fallback, thinking-config rejection,
+   and automatic continuation when output hits the token ceiling. */
+function geminiRequest(key, userPrompt, systemPrompt, modelIndex, priorText, useThinkingCfg, depth){
+  var idx = modelIndex || 0;
+  var prior = priorText || '';
+  var useTC = (useThinkingCfg === undefined) ? true : useThinkingCfg;
+  var d = depth || 0;
+
+  if(idx >= GEMINI_MODELS.length){
+    return Promise.reject(new Error('None of the available Gemini models responded. Try again shortly, or switch modes in Setup.'));
+  }
+  if(d > 3){
+    // Give back what we have rather than looping forever
+    return Promise.resolve({ text: prior, model: GEMINI_MODELS[idx], truncated: true });
+  }
+
   var model = GEMINI_MODELS[idx];
   var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + encodeURIComponent(key);
 
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-      generationConfig: { temperature: 0.85, maxOutputTokens: 1600 }
-    })
+    body: JSON.stringify(geminiBody(userPrompt, systemPrompt, prior, model, useTC))
   })
   .then(function(r){
     return r.json().then(function(j){
       if(!r.ok){
         var msg = (j && j.error && j.error.message) ? j.error.message : ('Request failed (' + r.status + ')');
-        // If this model is unavailable, silently try the next one
+        // Model unavailable -> try the next one in the chain
         if(r.status === 404 || /not found|not supported/i.test(msg)){
-          return geminiRequest(key, userPrompt, systemPrompt, idx + 1);
+          return geminiRequest(key, userPrompt, systemPrompt, idx + 1, prior, true, d);
+        }
+        // Model refuses thinkingBudget -> retry the same model without it
+        if(/thinking_budget|thinkingBudget|thinking/i.test(msg) && useTC){
+          return geminiRequest(key, userPrompt, systemPrompt, idx, prior, false, d);
         }
         throw new Error(msg);
       }
-      var text = '';
-      if(j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts){
-        j.candidates[0].content.parts.forEach(function(p){ if(p.text) text += p.text; });
+
+      var cand = (j && j.candidates && j.candidates[0]) ? j.candidates[0] : null;
+      var chunk = '';
+      if(cand && cand.content && cand.content.parts){
+        cand.content.parts.forEach(function(p){ if(p.text) chunk += p.text; });
       }
-      if(!text) throw new Error('The model returned an empty response. Try Regenerate.');
-      return { text: text.trim(), model: model };
+
+      var finish = cand ? (cand.finishReason || '') : '';
+
+      // Thinking consumed the whole budget and left no text
+      if(!chunk && finish === 'MAX_TOKENS'){
+        if(useTC) return geminiRequest(key, userPrompt, systemPrompt, idx, prior, false, d + 1);
+        throw new Error('The model used its entire output budget without producing text. Try Regenerate, or switch to Template mode.');
+      }
+      if(!chunk && !prior){
+        var why = finish === 'SAFETY' ? 'The request was blocked by a content filter. Try rewording the story field.'
+                : finish === 'RECITATION' ? 'The response was blocked as too close to existing text. Try Regenerate.'
+                : 'The model returned an empty response. Try Regenerate.';
+        throw new Error(why);
+      }
+
+      var combined = prior ? (prior + chunk) : chunk;
+
+      // Hit the ceiling mid-letter -> continue automatically
+      if(finish === 'MAX_TOKENS'){
+        return geminiRequest(key, userPrompt, systemPrompt, idx, combined, useTC, d + 1);
+      }
+
+      return { text: combined.trim(), model: model, truncated: false };
     });
   });
 }
 
-/* Reusable Claude request */
-function claudeRequest(key, userPrompt, systemPrompt){
+/* Reusable Claude request with automatic continuation on truncation */
+function claudeRequest(key, userPrompt, systemPrompt, priorText, depth){
+  var prior = priorText || '';
+  var d = depth || 0;
+  if(d > 3) return Promise.resolve({ text: prior, model: 'claude-sonnet-4', truncated: true });
+
+  var msgs = [{ role: 'user', content: userPrompt }];
+  if(prior){
+    msgs.push({ role: 'assistant', content: prior });
+    msgs.push({ role: 'user', content: 'Continue from exactly where that stopped. Do not repeat anything already written and do not add commentary. Carry through to the full sign-off.' });
+  }
+
   return fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -648,9 +752,9 @@ function claudeRequest(key, userPrompt, systemPrompt){
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1600,
+      max_tokens: 4000,
       system: systemPrompt,
-      messages: [{ role: 'user', content: userPrompt }]
+      messages: msgs
     })
   })
   .then(function(r){
@@ -659,14 +763,24 @@ function claudeRequest(key, userPrompt, systemPrompt){
         var msg = (j && j.error && j.error.message) ? j.error.message : ('Request failed (' + r.status + ')');
         throw new Error(msg);
       }
-      var text = '';
+      var chunk = '';
       if(j && j.content && j.content.length){
-        j.content.forEach(function(b){ if(b.type === 'text') text += b.text; });
+        j.content.forEach(function(b){ if(b.type === 'text') chunk += b.text; });
       }
-      if(!text) throw new Error('Empty response. Try Regenerate.');
-      return { text: text.trim(), model: 'claude-sonnet-4' };
+      if(!chunk && !prior) throw new Error('Empty response. Try Regenerate.');
+
+      var combined = prior ? (prior + chunk) : chunk;
+      if(j.stop_reason === 'max_tokens'){
+        return claudeRequest(key, userPrompt, systemPrompt, combined, d + 1);
+      }
+      return { text: combined.trim(), model: 'claude-sonnet-4', truncated: false };
     });
   });
+}
+
+/* Does the letter actually reach the sign-off? */
+function looksComplete(text){
+  return /Maximillion\s+Frommelt/i.test(text) && /Yours,/i.test(text);
 }
 
 /* On any API failure, fall back to the template so the work is never lost */
